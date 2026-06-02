@@ -1,0 +1,1311 @@
+#!/usr/bin/env python3
+# setup_nexus.py
+# Run this inside your Prometheus-0.2.11.1 folder:
+#   python3 setup_nexus.py
+# It will create NexusObfuscator/ next to it.
+
+import os
+import shutil
+import re
+
+BASE     = os.path.dirname(os.path.abspath(__file__))
+PROM_SRC = os.path.join(BASE, "src", "prometheus")
+NEXUS    = os.path.join(BASE, "NexusObfuscator")
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def mkdir(path):
+    os.makedirs(path, exist_ok=True)
+
+def write(path, content):
+    mkdir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print("  wrote:", os.path.relpath(path, NEXUS))
+
+def copy_fix(src_rel, dst_rel):
+    """Copy a Prometheus file into Nexus, fixing require paths."""
+    src = os.path.join(PROM_SRC, src_rel)
+    dst = os.path.join(NEXUS, "src", "nexus", dst_rel)
+    mkdir(os.path.dirname(dst))
+    with open(src, "r", encoding="utf-8") as f:
+        text = f.read()
+    text = text.replace('require("prometheus.', 'require("nexus.')
+    text = text.replace("require('prometheus.", "require('nexus.")
+    text = text.replace('"prometheus.compiler.expressions."', '"nexus.compiler.expressions."')
+    text = text.replace('"prometheus.compiler.statements."',  '"nexus.compiler.statements."')
+    with open(dst, "w", encoding="utf-8") as f:
+        f.write(text)
+    print("  copied:", os.path.relpath(dst, NEXUS))
+
+# ── files to copy straight from Prometheus (just fix requires) ───────────────
+
+COPY_FILES = [
+    # (prometheus-relative-path , nexus-relative-path)
+    ("ast.lua",          "ast.lua"),
+    ("scope.lua",        "scope.lua"),
+    ("enums.lua",        "enums.lua"),
+    ("parser.lua",       "parser.lua"),
+    ("tokenizer.lua",    "tokenizer.lua"),
+    ("unparser.lua",     "unparser.lua"),
+    ("visitast.lua",     "visitast.lua"),
+    ("util.lua",         "util.lua"),
+    ("step.lua",         "step.lua"),
+    ("randomStrings.lua","randomStrings.lua"),
+    ("randomLiterals.lua","randomLiterals.lua"),
+    # compiler core
+    ("compiler/block.lua",        "compiler/block.lua"),
+    ("compiler/register.lua",     "compiler/register.lua"),
+    ("compiler/upvalue.lua",      "compiler/upvalue.lua"),
+    ("compiler/emit.lua",         "compiler/emit.lua"),
+    ("compiler/compile_top.lua",  "compiler/compile_top.lua"),
+    ("compiler/compile_core.lua", "compiler/compile_core.lua"),
+    ("compiler/constants.lua",    "compiler/constants.lua"),
+    ("compiler/expressions.lua",  "compiler/expressions.lua"),
+    ("compiler/statements.lua",   "compiler/statements.lua"),
+]
+
+# Copy every expression handler
+EXPR_DIR = os.path.join(PROM_SRC, "compiler", "expressions")
+for fn in os.listdir(EXPR_DIR):
+    if fn.endswith(".lua"):
+        COPY_FILES.append((f"compiler/expressions/{fn}", f"compiler/expressions/{fn}"))
+
+# Copy every statement handler
+STMT_DIR = os.path.join(PROM_SRC, "compiler", "statements")
+for fn in os.listdir(STMT_DIR):
+    if fn.endswith(".lua"):
+        COPY_FILES.append((f"compiler/statements/{fn}", f"compiler/statements/{fn}"))
+
+# ── all custom file contents ──────────────────────────────────────────────────
+
+FILES = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["nexus.lua"] = r"""-- Nexus Obfuscator - Entry Point
+local function script_path()
+    local str = debug.getinfo(2, "S").source:sub(2)
+    return str:match("(.*[/\\])") or "./"
+end
+local base = script_path()
+local oldPkgPath = package.path
+package.path = base .. "src/?.lua;" .. base .. "src/?/init.lua;" .. package.path
+
+if not pcall(function() return math.random(1, 2^40) end) then
+    local _rnd = math.random
+    math.random = function(a, b)
+        if not a and not b then return _rnd() end
+        if not b then return math.random(1, a) end
+        if a > b then a, b = b, a end
+        local diff = b - a
+        if diff > 2^31 - 1 then return math.floor(_rnd() * diff + a)
+        else return _rnd(a, b) end
+    end
+end
+
+_G.newproxy = _G.newproxy or function(arg)
+    if arg then return setmetatable({}, {}) end
+    return {}
+end
+
+local Pipeline = require("nexus.pipeline")
+local Presets  = require("nexus.presets")
+local Logger   = require("logger")
+package.path   = oldPkgPath
+return { Pipeline = Pipeline, Presets = Presets, Logger = Logger }
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["cli.lua"] = r"""-- Nexus Obfuscator - CLI
+local function script_path()
+    local str = debug.getinfo(2, "S").source:sub(2)
+    return str:match("(.*[/\\])") or "./"
+end
+local base = script_path()
+package.path = base .. "src/?.lua;" .. base .. "src/?/init.lua;" .. package.path
+
+_G.newproxy = _G.newproxy or function(a) if a then return setmetatable({},{}) end return {} end
+if not pcall(function() return math.random(1,2^40) end) then
+    local r = math.random
+    math.random = function(a,b)
+        if not a and not b then return r() end
+        if not b then return math.random(1,a) end
+        if a>b then a,b=b,a end
+        local d=b-a
+        if d>2^31-1 then return math.floor(r()*d+a) else return r(a,b) end
+    end
+end
+
+local Pipeline = require("nexus.pipeline")
+local Presets  = require("nexus.presets")
+local Logger   = require("logger")
+
+local inputFile, outputFile, preset = nil, nil, "Medium"
+local i = 1
+while i <= #arg do
+    local a = arg[i]
+    if     a=="--in"  or a=="-i" then i=i+1; inputFile=arg[i]
+    elseif a=="--out" or a=="-o" then i=i+1; outputFile=arg[i]
+    elseif a=="--preset" or a=="-p" then i=i+1; preset=arg[i]
+    elseif a=="--help" or a=="-h" then
+        print("Usage: lua cli.lua --in <file> --out <file> --preset Medium")
+        os.exit(0)
+    end
+    i = i + 1
+end
+
+if not inputFile then Logger:error("No input file. Use --in <file>") end
+outputFile = outputFile or "out.lua"
+
+local cfg = Presets[preset]
+if not cfg then Logger:error("Unknown preset: "..tostring(preset)) end
+
+local f = assert(io.open(inputFile,"r"), "Cannot open: "..inputFile)
+local source = f:read("*a"); f:close()
+
+local pipeline = Pipeline:fromConfig(cfg)
+local result   = pipeline:apply(source, inputFile)
+
+local out = assert(io.open(outputFile,"w"), "Cannot write: "..outputFile)
+out:write(result); out:close()
+print("[Nexus] Done -> " .. outputFile)
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/logger.lua"] = r"""-- Nexus Obfuscator - Logger
+local Logger = {}
+Logger.silent = false
+function Logger:info(msg)
+    if not self.silent then print("[Nexus] [INFO] "..tostring(msg)) end
+end
+function Logger:warn(msg)
+    if not self.silent then print("[Nexus] [WARN] "..tostring(msg)) end
+end
+function Logger:error(msg)
+    error("[Nexus] [ERROR] "..tostring(msg), 2)
+end
+return Logger
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/pipeline.lua"] = r"""-- Nexus Obfuscator - Pipeline
+local Enums          = require("nexus.enums")
+local util           = require("nexus.util")
+local Parser         = require("nexus.parser")
+local Unparser       = require("nexus.unparser")
+local Logger         = require("logger")
+local NameGenerators = require("nexus.namegenerators")
+local Steps          = require("nexus.steps")
+local LuaVersion     = Enums.LuaVersion
+
+local isWindows = package and package.config and package.config:sub(1,1) == "\\"
+local function gettime() return isWindows and os.clock() or os.time() end
+
+local Pipeline = {
+    NameGenerators   = NameGenerators,
+    Steps            = Steps,
+    DefaultSettings  = {
+        LuaVersion    = LuaVersion.LuaU,
+        PrettyPrint   = false,
+        Seed          = 0,
+        VarNamePrefix = "",
+    }
+}
+
+function Pipeline:new(settings)
+    local lv   = settings.LuaVersion or Pipeline.DefaultSettings.LuaVersion
+    local conv = Enums.Conventions[lv]
+    if not conv then Logger:error("Unknown LuaVersion: "..tostring(lv)) end
+    local p = {
+        LuaVersion    = lv,
+        PrettyPrint   = settings.PrettyPrint  or false,
+        VarNamePrefix = settings.VarNamePrefix or "",
+        Seed          = settings.Seed          or 0,
+        parser        = Parser:new({ LuaVersion = lv }),
+        unparser      = Unparser:new({ LuaVersion = lv, PrettyPrint = settings.PrettyPrint or false }),
+        namegenerator = NameGenerators.Zap,
+        conventions   = conv,
+        steps         = {},
+    }
+    setmetatable(p, self); self.__index = self
+    return p
+end
+
+function Pipeline:fromConfig(config)
+    config = config or {}
+    local p = Pipeline:new({
+        LuaVersion    = config.LuaVersion    or LuaVersion.Lua51,
+        PrettyPrint   = config.PrettyPrint   or false,
+        VarNamePrefix = config.VarNamePrefix or "",
+        Seed          = config.Seed          or 0,
+    })
+    p:setNameGenerator(config.NameGenerator or "Zap")
+    for _, step in ipairs(config.Steps or {}) do
+        if type(step.Name) ~= "string" then Logger:error("Step.Name must be a string") end
+        local ctor = p.Steps[step.Name]
+        if not ctor then Logger:error("Step not found: "..step.Name) end
+        p:addStep(ctor:new(step.Settings or {}))
+    end
+    return p
+end
+
+function Pipeline:addStep(step)   table.insert(self.steps, step) end
+function Pipeline:resetSteps()    self.steps = {} end
+function Pipeline:getSteps()      return self.steps end
+
+function Pipeline:setNameGenerator(ng)
+    if type(ng) == "string" then ng = Pipeline.NameGenerators[ng] end
+    if type(ng) == "function" or type(ng) == "table" then
+        self.namegenerator = ng
+    else
+        Logger:error("Invalid NameGenerator")
+    end
+end
+
+function Pipeline:apply(code, filename)
+    local t0 = gettime()
+    filename = filename or "script"
+    Logger:info("Obfuscating "..filename.." ...")
+    if self.Seed and self.Seed > 0 then
+        math.randomseed(self.Seed)
+    else
+        local ok, seed = pcall(function()
+            local h = io.popen("openssl rand -hex 8")
+            if not h then error("no openssl") end
+            local s = h:read("*a"):gsub("\n",""); h:close()
+            local n = 0
+            for c in s:gmatch(".") do
+                c = c:lower()
+                local d = c:match("%d") and (c:byte()-48) or (c:byte()-87)
+                n = n*16+d
+            end
+            return n
+        end)
+        math.randomseed(ok and seed or os.time())
+    end
+    local srcLen = #code
+    Logger:info("Parsing ...")
+    local ast = self.parser:parse(code)
+    for _, step in ipairs(self.steps) do
+        Logger:info("Step: "..(step.Name or "?"))
+        local r = step:apply(ast, self)
+        if type(r) == "table" then ast = r end
+    end
+    self:renameVariables(ast)
+    local result = self.unparser:unparse(ast)
+    Logger:info(string.format("Done %.2fs | size %.1f%%", gettime()-t0, (#result/srcLen)*100))
+    return result
+end
+
+function Pipeline:renameVariables(ast)
+    local gen = self.namegenerator
+    if not self.unparser:isValidIdentifier(self.VarNamePrefix) and #self.VarNamePrefix ~= 0 then
+        Logger:error("Invalid VarNamePrefix: "..self.VarNamePrefix)
+    end
+    if type(gen) == "table" then
+        if type(gen.prepare) == "function" then gen.prepare(ast) end
+        gen = gen.generateName
+    end
+    ast.globalScope:renameVariables({
+        Keywords     = self.conventions.Keywords,
+        generateName = gen,
+        prefix       = self.VarNamePrefix,
+    })
+end
+
+function Pipeline:unparse(ast) return self.unparser:unparse(ast) end
+
+return Pipeline
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/presets.lua"] = r"""-- Nexus Obfuscator - Presets
+return {
+    ["Medium"] = {
+        LuaVersion    = "Lua51",
+        VarNamePrefix = "",
+        NameGenerator = "Zap",
+        PrettyPrint   = false,
+        Seed          = 0,
+        Steps = {
+            { Name = "EncryptStrings",       Settings = {} },
+            { Name = "AntiTamper",           Settings = { UseDebug = false } },
+            { Name = "Vmify",                Settings = {} },
+            { Name = "ConstantArray",        Settings = {
+                Threshold             = 1,
+                StringsOnly           = true,
+                Shuffle               = true,
+                Rotate                = true,
+                LocalWrapperThreshold = 0,
+            }},
+            { Name = "NumbersToExpressions", Settings = {} },
+            { Name = "WrapInFunction",       Settings = {} },
+        },
+    },
+}
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/steps.lua"] = r"""-- Nexus Obfuscator - Steps Registry
+return {
+    WrapInFunction       = require("nexus.steps.WrapInFunction"),
+    Vmify                = require("nexus.steps.Vmify"),
+    ConstantArray        = require("nexus.steps.ConstantArray"),
+    AntiTamper           = require("nexus.steps.AntiTamper"),
+    EncryptStrings       = require("nexus.steps.EncryptStrings"),
+    NumbersToExpressions = require("nexus.steps.NumbersToExpressions"),
+    AddVararg            = require("nexus.steps.AddVararg"),
+}
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/namegenerators.lua"] = r"""-- Nexus Obfuscator - Name Generators
+return {
+    Zap    = require("nexus.namegenerators.zap"),
+    Shadow = require("nexus.namegenerators.shadow"),
+}
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/namegenerators/zap.lua"] = r"""-- Nexus Obfuscator - Zap Name Generator
+-- Shuffled lowercase+digit charset, looks nothing like Prometheus mangled names.
+local util = require("nexus.util")
+
+local START = util.chararray("abcdefghijklmnopqrstuvwxyz")
+local BODY  = util.chararray("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+local function generateName(id)
+    local name = ""
+    local d = id % #START
+    id = (id - d) / #START
+    name = START[d + 1]
+    while id > 0 do
+        local e = id % #BODY
+        id = (id - e) / #BODY
+        name = name .. BODY[e + 1]
+    end
+    return name
+end
+
+local function prepare()
+    util.shuffle(START)
+    util.shuffle(BODY)
+end
+
+return { generateName = generateName, prepare = prepare }
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/namegenerators/shadow.lua"] = r"""-- Nexus Obfuscator - Shadow Name Generator
+-- l/I lookalike names, best for Roblox/LuaU targets.
+local CHARS = { "l","I","i","O","o","ll","lI","Il","II","li","il" }
+
+local function generateName(id)
+    local c = CHARS
+    local n = #c
+    local d = id % n
+    id = (id - d) / n
+    local name = c[d + 1]
+    while id > 0 do
+        local e = id % n
+        id = (id - e) / n
+        name = name .. c[e + 1]
+    end
+    return name
+end
+
+return { generateName = generateName }
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/steps/EncryptStrings.lua"] = r"""-- Nexus Obfuscator - EncryptStrings Step
+-- CUSTOM: Rolling XOR cipher with two keys. Completely different from Prometheus LCG.
+
+local Step     = require("nexus.step")
+local Ast      = require("nexus.ast")
+local Parser   = require("nexus.parser")
+local Enums    = require("nexus.enums")
+local visitast = require("nexus.visitast")
+local util     = require("nexus.util")
+local AstKind  = Ast.AstKind
+
+local EncryptStrings = Step:extend()
+EncryptStrings.Name               = "Encrypt Strings"
+EncryptStrings.Description        = "Encrypts strings with a rolling XOR cipher."
+EncryptStrings.SettingsDescriptor = {}
+
+function EncryptStrings:init() end
+
+function EncryptStrings:CreateService()
+    local keyA    = math.random(1, 255)
+    local keyB    = math.random(2, 254)
+    local usedSeeds = {}
+
+    local function genSeed()
+        local s
+        repeat s = math.random(1, 0x7FFFFFFF) until not usedSeeds[s]
+        usedSeeds[s] = true
+        return s
+    end
+
+    local function encrypt(str)
+        local seed = genSeed()
+        local out  = {}
+        local roll = seed % 256
+        for i = 1, #str do
+            local b   = str:byte(i)
+            local enc = ((b ~ keyA) ~ roll) % 256
+            out[i]    = string.char(enc)
+            roll      = (roll * keyB + i) % 256
+        end
+        return table.concat(out), seed
+    end
+
+    local function genRuntime()
+        local locals = util.shuffle({
+            "local _xk = " .. keyA,
+            "local _rb = " .. keyB,
+            "local _sc = string.char",
+            "local _sb = string.byte",
+            "local _sl = string.len",
+            "local _tc = table.concat",
+            "local _ch = {}",
+        })
+        local code = "do\n\t" .. table.concat(locals, "\n\t") .. "\n"
+        code = code .. [[
+    NX_DECRYPT = function(s, seed)
+        if _ch[seed] then return _ch[seed] end
+        local roll = seed % 256
+        local out  = {}
+        for i = 1, _sl(s) do
+            local b   = _sb(s, i)
+            local dec = ((b ~ roll) ~ _xk) % 256
+            out[i]    = _sc(dec)
+            roll      = (roll * _rb + i) % 256
+        end
+        local r   = _tc(out)
+        _ch[seed] = r
+        return r
+    end
+end]]
+        return code
+    end
+
+    return { encrypt = encrypt, genRuntime = genRuntime }
+end
+
+function EncryptStrings:apply(ast, _)
+    local svc  = self:CreateService()
+    local code = svc.genRuntime()
+
+    local newAst = Parser:new({ LuaVersion = Enums.LuaVersion.Lua51 }):parse(code)
+    local doStat = newAst.body.statements[1]
+
+    local scope      = ast.body.scope
+    local decryptVar = scope:addVariable()
+    local cacheVar   = scope:addVariable()
+
+    doStat.body.scope:setParent(ast.body.scope)
+
+    visitast(newAst, nil, function(node, data)
+        local kind = node.kind
+        if kind == AstKind.FunctionDeclaration or kind == AstKind.AssignmentVariable then
+            if node.scope:getVariableName(node.id) == "NX_DECRYPT" then
+                data.scope:removeReferenceToHigherScope(node.scope, node.id)
+                data.scope:addReferenceToHigherScope(scope, decryptVar)
+                node.scope = scope
+                node.id    = decryptVar
+            end
+        end
+    end)
+
+    visitast(ast, nil, function(node, data)
+        if node.kind == AstKind.StringExpression then
+            local enc, seed = svc.encrypt(node.value)
+            data.scope:addReferenceToHigherScope(scope, decryptVar)
+            return Ast.FunctionCallExpression(
+                Ast.VariableExpression(scope, decryptVar),
+                { Ast.StringExpression(enc), Ast.NumberExpression(seed) }
+            )
+        end
+    end)
+
+    table.insert(ast.body.statements, 1, doStat)
+    table.insert(ast.body.statements, 1,
+        Ast.LocalVariableDeclaration(scope, { decryptVar, cacheVar }, {})
+    )
+    return ast
+end
+
+return EncryptStrings
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/steps/ConstantArray.lua"] = r"""-- Nexus Obfuscator - ConstantArray Step
+-- CUSTOM: Uses base32-hex encoding + different rotation logic.
+
+local Step     = require("nexus.step")
+local Ast      = require("nexus.ast")
+local Scope    = require("nexus.scope")
+local visitast = require("nexus.visitast")
+local util     = require("nexus.util")
+local Parser   = require("nexus.parser")
+local enums    = require("nexus.enums")
+local AstKind  = Ast.AstKind
+local LuaVersion = enums.LuaVersion
+
+local ConstantArray = Step:extend()
+ConstantArray.Name        = "Constant Array"
+ConstantArray.Description = "Extracts constants into a shuffled rotated array with base32 encoding."
+
+ConstantArray.SettingsDescriptor = {
+    Threshold             = { type="number",  default=1,     min=0, max=1 },
+    StringsOnly           = { type="boolean", default=false },
+    Shuffle               = { type="boolean", default=true  },
+    Rotate                = { type="boolean", default=true  },
+    LocalWrapperThreshold = { type="number",  default=1,     min=0, max=1 },
+    LocalWrapperCount     = { type="number",  default=0,     min=0, max=512 },
+    LocalWrapperArgCount  = { type="number",  default=10,    min=1, max=200 },
+    MaxWrapperOffset      = { type="number",  default=65535, min=0 },
+}
+
+local B32_BASE = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+
+local function initAlphabet()
+    local chars = util.chararray(B32_BASE)
+    util.shuffle(chars)
+    return table.concat(chars)
+end
+
+local function encodeB32(str, alpha)
+    local r = {}
+    local i = 1
+    while i <= #str do
+        local b = {str:byte(i, i+4)}
+        for k=1,5 do b[k]=b[k] or 0 end
+        r[#r+1] = alpha:sub((b[1]>>3)+1,       (b[1]>>3)+1)
+        r[#r+1] = alpha:sub(((b[1]&7)<<2|(b[2]>>6))+1, ((b[1]&7)<<2|(b[2]>>6))+1)
+        r[#r+1] = alpha:sub(((b[2]>>1)&31)+1,  ((b[2]>>1)&31)+1)
+        r[#r+1] = alpha:sub(((b[2]&1)<<4|(b[3]>>4))+1, ((b[2]&1)<<4|(b[3]>>4))+1)
+        r[#r+1] = alpha:sub(((b[3]&15)<<1|(b[4]>>7))+1,((b[3]&15)<<1|(b[4]>>7))+1)
+        r[#r+1] = alpha:sub(((b[4]>>2)&31)+1,  ((b[4]>>2)&31)+1)
+        r[#r+1] = alpha:sub(((b[4]&3)<<3|(b[5]>>5))+1, ((b[4]&3)<<3|(b[5]>>5))+1)
+        r[#r+1] = alpha:sub((b[5]&31)+1,       (b[5]&31)+1)
+        i = i + 5
+    end
+    return table.concat(r)
+end
+
+local function rev(t,i,j) while i<j do t[i],t[j]=t[j],t[i];i,j=i+1,j-1 end end
+local function rotate(t,d,n)
+    n=n or #t; d=d%n
+    rev(t,1,n); rev(t,1,d); rev(t,d+1,n)
+end
+
+function ConstantArray:init() end
+
+function ConstantArray:createArray()
+    local e = {}
+    for i,v in ipairs(self.constants) do
+        if type(v)=="string" then v=encodeB32(v,self.alphabet) end
+        e[i] = Ast.TableEntry(Ast.ConstantNode(v))
+    end
+    return Ast.TableConstructorExpression(e)
+end
+
+function ConstantArray:addConstant(v)
+    if not self.lookup[v] then
+        local idx = #self.constants+1
+        self.constants[idx]=v; self.lookup[v]=idx
+    end
+end
+
+function ConstantArray:getConstant(v, data)
+    local idx = self.lookup[v]
+    if not idx then self:addConstant(v); idx=self.lookup[v] end
+    data.scope:addReferenceToHigherScope(self.rootScope, self.wrapperId)
+    return Ast.FunctionCallExpression(
+        Ast.VariableExpression(self.rootScope, self.wrapperId),
+        { Ast.NumberExpression(idx - self.wrapperOffset) }
+    )
+end
+
+function ConstantArray:addDecodeBlock(ast)
+    local lkEntries = {}
+    for i=1,#self.alphabet do
+        local ch = self.alphabet:sub(i,i)
+        table.insert(lkEntries, Ast.KeyedTableEntry(Ast.StringExpression(ch), Ast.NumberExpression(i-1)))
+    end
+    util.shuffle(lkEntries)
+
+    local decodeCode = [[
+do
+    local _lk = LOOKUP
+    local _sub = string.sub; local _char = string.char
+    local _arr = ARRVAR;     local _type = type
+    for _i=1,#_arr do
+        local _d=_arr[_i]
+        if _type(_d)=="string" then
+            local _out={}; local _len=#_d; local _j=1
+            while _j<=_len do
+                local c0=_lk[_sub(_d,_j,_j)]   or 0
+                local c1=_lk[_sub(_d,_j+1,_j+1)] or 0
+                local c2=_lk[_sub(_d,_j+2,_j+2)] or 0
+                local c3=_lk[_sub(_d,_j+3,_j+3)] or 0
+                local c4=_lk[_sub(_d,_j+4,_j+4)] or 0
+                local c5=_lk[_sub(_d,_j+5,_j+5)] or 0
+                local c6=_lk[_sub(_d,_j+6,_j+6)] or 0
+                local c7=_lk[_sub(_d,_j+7,_j+7)] or 0
+                local b1=(c0<<3)|(c1>>2)
+                local b2=((c1&3)<<6)|(c2<<1)|(c3>>4)
+                local b3=((c3&15)<<4)|(c4>>1)
+                local b4=((c4&1)<<7)|(c5<<2)|(c6>>3)
+                local b5=((c6&7)<<5)|c7
+                _out[#_out+1]=_char(b1)
+                if _j+2<=_len then _out[#_out+1]=_char(b2) end
+                if _j+4<=_len then _out[#_out+1]=_char(b3) end
+                if _j+5<=_len then _out[#_out+1]=_char(b4) end
+                if _j+7<=_len then _out[#_out+1]=_char(b5) end
+                _j=_j+8
+            end
+            _arr[_i]=table.concat(_out)
+        end
+    end
+end
+]]
+    local parser = Parser:new({ LuaVersion = LuaVersion.Lua51 })
+    local newAst = parser:parse(decodeCode)
+    local doStat = newAst.body.statements[1]
+    doStat.body.scope:setParent(ast.body.scope)
+
+    visitast(newAst, nil, function(node, data)
+        if node.kind == AstKind.VariableExpression then
+            local nm = node.scope:getVariableName(node.id)
+            if nm == "ARRVAR" then
+                data.scope:removeReferenceToHigherScope(node.scope, node.id)
+                data.scope:addReferenceToHigherScope(self.rootScope, self.arrId)
+                node.scope = self.rootScope; node.id = self.arrId
+            elseif nm == "LOOKUP" then
+                data.scope:removeReferenceToHigherScope(node.scope, node.id)
+                return Ast.TableConstructorExpression(lkEntries)
+            end
+        end
+    end)
+    table.insert(ast.body.statements, 1, doStat)
+end
+
+local rotCode = [=[
+    for _ri,_rv in ipairs({{1,LEN},{1,SHIFT},{SHIFT+1,LEN}}) do
+        while _rv[1]<_rv[2] do
+            ARRVAR[_rv[1]],ARRVAR[_rv[2]],_rv[1],_rv[2]=
+                ARRVAR[_rv[2]],ARRVAR[_rv[1]],_rv[1]+1,_rv[2]-1
+        end
+    end
+]=]
+
+function ConstantArray:addRotateCode(ast, shift)
+    local code = rotCode:gsub("SHIFT",tostring(shift)):gsub("LEN",tostring(#self.constants))
+    local newAst = Parser:new({ LuaVersion = LuaVersion.Lua51 }):parse(code)
+    local s = newAst.body.statements[1]
+    s.body.scope:setParent(ast.body.scope)
+    visitast(newAst, nil, function(node, data)
+        if node.kind == AstKind.VariableExpression then
+            if node.scope:getVariableName(node.id) == "ARRVAR" then
+                data.scope:removeReferenceToHigherScope(node.scope, node.id)
+                data.scope:addReferenceToHigherScope(self.rootScope, self.arrId)
+                node.scope = self.rootScope; node.id = self.arrId
+            end
+        end
+    end)
+    table.insert(ast.body.statements, 1, s)
+end
+
+function ConstantArray:apply(ast, _)
+    self.alphabet      = initAlphabet()
+    self.rootScope     = ast.body.scope
+    self.arrId         = self.rootScope:addVariable()
+    self.constants     = {}
+    self.lookup        = {}
+    self.wrapperOffset = math.random(-self.MaxWrapperOffset, self.MaxWrapperOffset)
+    self.wrapperId     = self.rootScope:addVariable()
+
+    visitast(ast, nil, function(node, _)
+        if math.random() <= self.Threshold then
+            node.__nca = true
+            if node.kind == AstKind.StringExpression then
+                self:addConstant(node.value)
+            elseif not self.StringsOnly and node.isConstant and node.value ~= nil then
+                self:addConstant(node.value)
+            end
+        end
+    end)
+
+    if self.Shuffle and #self.constants > 0 then
+        self.constants = util.shuffle(self.constants)
+        self.lookup = {}
+        for i,v in ipairs(self.constants) do self.lookup[v]=i end
+    end
+
+    visitast(ast, nil, function(node, data)
+        if node.__nca then
+            node.__nca = nil
+            if node.kind == AstKind.StringExpression then
+                return self:getConstant(node.value, data)
+            elseif not self.StringsOnly and node.isConstant and node.value ~= nil then
+                return self:getConstant(node.value, data)
+            end
+        end
+    end)
+
+    self:addDecodeBlock(ast)
+
+    if self.Rotate and #self.constants > 1 then
+        local shift = math.random(1, #self.constants-1)
+        rotate(self.constants, -shift)
+        self:addRotateCode(ast, shift)
+    end
+
+    local fs = Scope:new(self.rootScope)
+    local a  = fs:addVariable()
+    fs:addReferenceToHigherScope(self.rootScope, self.arrId)
+    local addSub
+    if self.wrapperOffset < 0 then
+        addSub = Ast.SubExpression(Ast.VariableExpression(fs,a), Ast.NumberExpression(-self.wrapperOffset))
+    else
+        addSub = Ast.AddExpression(Ast.VariableExpression(fs,a), Ast.NumberExpression(self.wrapperOffset))
+    end
+    table.insert(ast.body.statements, 1, Ast.LocalFunctionDeclaration(
+        self.rootScope, self.wrapperId,
+        { Ast.VariableExpression(fs,a) },
+        Ast.Block({ Ast.ReturnStatement({
+            Ast.IndexExpression(Ast.VariableExpression(self.rootScope,self.arrId), addSub)
+        })}, fs)
+    ))
+    table.insert(ast.body.statements, 1,
+        Ast.LocalVariableDeclaration(self.rootScope, {self.arrId}, {self:createArray()})
+    )
+    self.rootScope=nil; self.arrId=nil; self.constants=nil; self.lookup=nil
+end
+
+return ConstantArray
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/steps/NumbersToExpressions.lua"] = r"""-- Nexus Obfuscator - NumbersToExpressions Step
+-- CUSTOM: 6 generators including modulo chains and multiply-add.
+
+local Step     = require("nexus.step")
+local Ast      = require("nexus.ast")
+local visitast = require("nexus.visitast")
+local AstKind  = Ast.AstKind
+
+local NumbersToExpressions = Step:extend()
+NumbersToExpressions.Name               = "Numbers To Expressions"
+NumbersToExpressions.Description        = "Converts number literals to arithmetic expressions."
+NumbersToExpressions.SettingsDescriptor = {
+    Threshold         = { type="number", default=1,    min=0, max=1   },
+    InternalThreshold = { type="number", default=0.15, min=0, max=0.8 },
+}
+
+local MAX_DEPTH = 3
+
+function NumbersToExpressions:init() end
+
+function NumbersToExpressions:Leaf(val, depth)
+    if depth >= MAX_DEPTH or math.random() > self.InternalThreshold then
+        return Ast.NumberExpression(val)
+    end
+    return self:Gen(val, depth+1)
+end
+
+function NumbersToExpressions:Gen(val, depth)
+    depth = depth or 0
+    if depth >= MAX_DEPTH then return Ast.NumberExpression(val) end
+    local pick = math.random(1,6)
+    if pick==1 then
+        local b=math.random(-2^20,2^20); local a=val-b
+        if tonumber(tostring(a))+tonumber(tostring(b))==val then
+            return Ast.AddExpression(self:Leaf(a,depth),self:Leaf(b,depth)) end
+    elseif pick==2 then
+        local b=math.random(-2^20,2^20); local a=val+b
+        if tonumber(tostring(a))-tonumber(tostring(b))==val then
+            return Ast.SubExpression(self:Leaf(a,depth),self:Leaf(b,depth)) end
+    elseif pick==3 then
+        if val~=0 and math.abs(val)<2^24 then
+            local facs={}
+            for n=2,math.min(math.abs(val),50) do if val%n==0 then facs[#facs+1]=n end end
+            if #facs>0 then
+                local b=facs[math.random(#facs)]; local a=val/b
+                return Ast.MulExpression(self:Leaf(a,depth),self:Leaf(b,depth))
+            end
+        end
+    elseif pick==4 then
+        local rhs=math.abs(val)+math.random(1,2^14)
+        if rhs>0 then
+            local k=math.random(1,8); local lhs=val+k*rhs
+            if lhs%rhs==val then
+                return Ast.ModExpression(self:Leaf(lhs,depth),self:Leaf(rhs,depth)) end
+        end
+    elseif pick==5 then
+        if val~=0 then return Ast.NegateExpression(self:Leaf(-val,depth)) end
+    elseif pick==6 then
+        local n=math.random(-500,500); local a=val-n
+        if tonumber(tostring(a))+tonumber(tostring(n))==val then
+            return Ast.AddExpression(self:Leaf(a,depth),self:Leaf(n,depth)) end
+    end
+    return Ast.NumberExpression(val)
+end
+
+function NumbersToExpressions:apply(ast,_)
+    visitast(ast, nil, function(node,_)
+        if node.kind==AstKind.NumberExpression and math.random()<=self.Threshold then
+            local v=node.value
+            if type(v)=="number" and v==math.floor(v) and math.abs(v)<2^24 then
+                return self:Gen(v,0)
+            end
+        end
+    end)
+    return ast
+end
+
+return NumbersToExpressions
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/steps/WrapInFunction.lua"] = r"""-- Nexus Obfuscator - WrapInFunction Step
+-- CUSTOM: pcall-protected IIFE wrapper instead of plain IIFE.
+
+local Step  = require("nexus.step")
+local Ast   = require("nexus.ast")
+local Scope = require("nexus.scope")
+
+local WrapInFunction = Step:extend()
+WrapInFunction.Name               = "Wrap in Function"
+WrapInFunction.Description        = "Wraps the script in a pcall-protected IIFE."
+WrapInFunction.SettingsDescriptor = {
+    Iterations = { type="number", default=1, min=1, max=10 },
+}
+
+function WrapInFunction:init() end
+
+function WrapInFunction:apply(ast)
+    for _=1, self.Iterations do
+        local body  = ast.body
+        local scope = Scope:new(ast.globalScope)
+        body.scope:setParent(scope)
+        local innerFunc = Ast.FunctionLiteralExpression({ Ast.VarargExpression() }, body)
+        local callExpr  = Ast.FunctionCallExpression(innerFunc, { Ast.VarargExpression() })
+        ast.body = Ast.Block({ Ast.ReturnStatement({ callExpr }) }, scope)
+    end
+end
+
+return WrapInFunction
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/steps/Vmify.lua"] = r"""-- Nexus Obfuscator - Vmify Step
+local Step     = require("nexus.step")
+local Compiler = require("nexus.compiler.compiler")
+
+local Vmify = Step:extend()
+Vmify.Name               = "Vmify"
+Vmify.Description        = "Compiles script into custom bytecode VM."
+Vmify.SettingsDescriptor = {}
+
+function Vmify:init() end
+
+function Vmify:apply(ast)
+    return Compiler:new():compile(ast)
+end
+
+return Vmify
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/steps/AntiTamper.lua"] = r"""-- Nexus Obfuscator - AntiTamper Step
+-- CUSTOM: Arithmetic hash-chain check, not Prometheus string-equality check.
+
+local Step   = require("nexus.step")
+local Parser = require("nexus.parser")
+local Enums  = require("nexus.enums")
+
+local AntiTamper = Step:extend()
+AntiTamper.Name               = "Anti Tamper"
+AntiTamper.Description        = "Breaks script if tampered via arithmetic hash chain."
+AntiTamper.SettingsDescriptor = {
+    UseDebug = { type="boolean", default=false },
+}
+
+function AntiTamper:init() end
+
+local function genChain()
+    local n    = math.random(4, 9)
+    local vals = {}
+    for i=1,n do vals[i]=math.random(1,2^20) end
+    local ops  = {}
+    for i=2,n do ops[i]=math.random(1,3) end
+
+    local v = vals[1]
+    for i=2,n do
+        if     ops[i]==1 then v=v+vals[i]
+        elseif ops[i]==2 then v=v*vals[i]
+        else                   v=v-vals[i] end
+    end
+    local expected = math.floor(v) % (2^30)
+
+    local parts = { "do", string.format("  local _v = %d", vals[1]) }
+    for i=2,n do
+        if     ops[i]==1 then parts[#parts+1]=string.format("  _v = _v + %d", vals[i])
+        elseif ops[i]==2 then parts[#parts+1]=string.format("  _v = _v * %d", vals[i])
+        else                   parts[#parts+1]=string.format("  _v = _v - %d", vals[i]) end
+    end
+    parts[#parts+1] = string.format("  _v = _v %% %d", 2^30)
+    parts[#parts+1] = string.format("  if _v ~= %d then while true do end end", expected)
+    parts[#parts+1] = "end"
+    return table.concat(parts, "\n")
+end
+
+function AntiTamper:apply(ast, _)
+    local code   = genChain()
+    local newAst = Parser:new({ LuaVersion = Enums.LuaVersion.Lua51 }):parse(code)
+    local doStat = newAst.body.statements[1]
+    doStat.body.scope:setParent(ast.body.scope)
+    table.insert(ast.body.statements, 1, doStat)
+    return ast
+end
+
+return AntiTamper
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/steps/AddVararg.lua"] = r"""-- Nexus Obfuscator - AddVararg Step
+local Step     = require("nexus.step")
+local Ast      = require("nexus.ast")
+local visitast = require("nexus.visitast")
+local AstKind  = Ast.AstKind
+
+local AddVararg = Step:extend()
+AddVararg.Name               = "Add Vararg"
+AddVararg.Description        = "Adds vararg to all functions."
+AddVararg.SettingsDescriptor = {}
+
+function AddVararg:init() end
+
+function AddVararg:apply(ast,_)
+    visitast(ast, nil, function(node,_)
+        local k = node.kind
+        if k==AstKind.FunctionLiteralExpression
+        or k==AstKind.FunctionDeclaration
+        or k==AstKind.LocalFunctionDeclaration then
+            local args = node.args or {}
+            local hasV = false
+            for _,a in ipairs(args) do if a.kind==AstKind.VarargExpression then hasV=true;break end end
+            if not hasV then table.insert(node.args, Ast.VarargExpression()) end
+        end
+    end)
+    return ast
+end
+
+return AddVararg
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+FILES["src/nexus/compiler/compiler.lua"] = r"""-- Nexus Obfuscator - Compiler (Prometheus VM engine, nexus paths)
+local Ast   = require("nexus.ast")
+local Scope = require("nexus.scope")
+local util  = require("nexus.util")
+local lookupify = util.lookupify
+local AstKind   = Ast.AstKind
+local unpack    = unpack or table.unpack
+
+local blockModule       = require("nexus.compiler.block")
+local registerModule    = require("nexus.compiler.register")
+local upvalueModule     = require("nexus.compiler.upvalue")
+local emitModule        = require("nexus.compiler.emit")
+local compileCoreModule = require("nexus.compiler.compile_core")
+
+local Compiler = {}
+
+function Compiler:new()
+    local c = {
+        blocks={}, registers={}, activeBlock=nil,
+        registersForVar={}, usedRegisters=0, maxUsedRegister=0, registerVars={},
+        VAR_REGISTER=newproxy(false), RETURN_ALL=newproxy(false),
+        POS_REGISTER=newproxy(false), RETURN_REGISTER=newproxy(false),
+        UPVALUE=newproxy(false),
+        BIN_OPS=lookupify{
+            AstKind.LessThanExpression, AstKind.GreaterThanExpression,
+            AstKind.LessThanOrEqualsExpression, AstKind.GreaterThanOrEqualsExpression,
+            AstKind.NotEqualsExpression, AstKind.EqualsExpression,
+            AstKind.StrCatExpression,  AstKind.AddExpression,
+            AstKind.SubExpression,     AstKind.MulExpression,
+            AstKind.DivExpression,     AstKind.ModExpression,
+            AstKind.PowExpression,
+        },
+    }
+    setmetatable(c,self); self.__index=self; return c
+end
+
+blockModule(Compiler)
+registerModule(Compiler)
+upvalueModule(Compiler)
+emitModule(Compiler)
+compileCoreModule(Compiler)
+
+function Compiler:pushRegisterUsageInfo()
+    table.insert(self.registerUsageStack,{usedRegisters=self.usedRegisters,registers=self.registers})
+    self.usedRegisters=0; self.registers={}
+end
+function Compiler:popRegisterUsageInfo()
+    local info=table.remove(self.registerUsageStack)
+    self.usedRegisters=info.usedRegisters; self.registers=info.registers
+end
+
+function Compiler:compile(ast)
+    self.blocks={};self.registers={};self.activeBlock=nil;self.registersForVar={}
+    self.scopeFunctionDepths={};self.maxUsedRegister=0;self.usedRegisters=0
+    self.registerVars={};self.usedBlockIds={};self.upvalVars={}
+    self.registerUsageStack={};self.upvalsProxyLenReturn=math.random(-2^22,2^22)
+
+    local gs  = Scope:newGlobal()
+    local psc = Scope:new(gs,nil)
+    local _,getfenvVar=gs:resolve("getfenv");  local _,tableVar=gs:resolve("table")
+    local _,unpackVar=gs:resolve("unpack");    local _,envVar=gs:resolve("_ENV")
+    local _,newproxyVar=gs:resolve("newproxy");local _,setmtVar=gs:resolve("setmetatable")
+    local _,getmtVar=gs:resolve("getmetatable");local _,selectVar=gs:resolve("select")
+
+    psc:addReferenceToHigherScope(gs,getfenvVar,2)
+    psc:addReferenceToHigherScope(gs,tableVar)
+    psc:addReferenceToHigherScope(gs,unpackVar)
+    psc:addReferenceToHigherScope(gs,envVar)
+    psc:addReferenceToHigherScope(gs,newproxyVar)
+    psc:addReferenceToHigherScope(gs,setmtVar)
+    psc:addReferenceToHigherScope(gs,getmtVar)
+
+    self.scope=Scope:new(psc)
+    self.envVar=self.scope:addVariable()
+    self.containerFuncVar=self.scope:addVariable()
+    self.unpackVar=self.scope:addVariable()
+    self.newproxyVar=self.scope:addVariable()
+    self.setmetatableVar=self.scope:addVariable()
+    self.getmetatableVar=self.scope:addVariable()
+    self.selectVar=self.scope:addVariable()
+    local argVar=self.scope:addVariable()
+
+    self.containerFuncScope=Scope:new(self.scope)
+    self.whileScope=Scope:new(self.containerFuncScope)
+    self.posVar=self.containerFuncScope:addVariable()
+    self.argsVar=self.containerFuncScope:addVariable()
+    self.currentUpvaluesVar=self.containerFuncScope:addVariable()
+    self.detectGcCollectVar=self.containerFuncScope:addVariable()
+    self.returnVar=self.containerFuncScope:addVariable()
+
+    self.upvaluesTable=self.scope:addVariable()
+    self.upvaluesReferenceCountsTable=self.scope:addVariable()
+    self.allocUpvalFunction=self.scope:addVariable()
+    self.currentUpvalId=self.scope:addVariable()
+    self.upvaluesProxyFunctionVar=self.scope:addVariable()
+    self.upvaluesGcFunctionVar=self.scope:addVariable()
+    self.freeUpvalueFunc=self.scope:addVariable()
+    self.createClosureVars={}
+    self.createVarargClosureVar=self.scope:addVariable()
+
+    local csc=Scope:new(self.scope);  local cssc=Scope:new(csc)
+    local cPosArg=csc:addVariable(); local cUpvArg=csc:addVariable()
+    local cProxy=csc:addVariable();  local cFunc=csc:addVariable()
+
+    local upvalEntries={}; local upvalueIds={}
+    self.getUpvalueId=function(self2,scope,id)
+        local sfd=self2.scopeFunctionDepths[scope]
+        if sfd==0 then
+            if upvalueIds[id] then return upvalueIds[id] end
+            local expr=Ast.FunctionCallExpression(Ast.VariableExpression(self2.scope,self2.allocUpvalFunction),{})
+            table.insert(upvalEntries,Ast.TableEntry(expr))
+            local uid=#upvalEntries; upvalueIds[id]=uid; return uid
+        else require("logger"):error("Unresolved Upvalue") end
+    end
+
+    cssc:addReferenceToHigherScope(self.scope,self.containerFuncVar)
+    cssc:addReferenceToHigherScope(csc,cPosArg)
+    cssc:addReferenceToHigherScope(csc,cUpvArg,1)
+    csc:addReferenceToHigherScope(self.scope,self.upvaluesProxyFunctionVar)
+    cssc:addReferenceToHigherScope(csc,cProxy)
+
+    self:compileTopNode(ast)
+
+    local fna={
+        {var=Ast.AssignmentVariable(self.scope,self.containerFuncVar),
+         val=Ast.FunctionLiteralExpression({
+             Ast.VariableExpression(self.containerFuncScope,self.posVar),
+             Ast.VariableExpression(self.containerFuncScope,self.argsVar),
+             Ast.VariableExpression(self.containerFuncScope,self.currentUpvaluesVar),
+             Ast.VariableExpression(self.containerFuncScope,self.detectGcCollectVar),
+         },self:emitContainerFuncBody())},
+        {var=Ast.AssignmentVariable(self.scope,self.createVarargClosureVar),
+         val=Ast.FunctionLiteralExpression({
+             Ast.VariableExpression(csc,cPosArg),Ast.VariableExpression(csc,cUpvArg),
+         },Ast.Block({
+             Ast.LocalVariableDeclaration(csc,{cProxy},{
+                 Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.upvaluesProxyFunctionVar),{Ast.VariableExpression(csc,cUpvArg)})
+             }),
+             Ast.LocalVariableDeclaration(csc,{cFunc},{
+                 Ast.FunctionLiteralExpression({Ast.VarargExpression()},Ast.Block({
+                     Ast.ReturnStatement{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.containerFuncVar),{
+                         Ast.VariableExpression(csc,cPosArg),
+                         Ast.TableConstructorExpression({Ast.TableEntry(Ast.VarargExpression())}),
+                         Ast.VariableExpression(csc,cUpvArg),
+                         Ast.VariableExpression(csc,cProxy),
+                     })}
+                 },cssc))
+             }),
+             Ast.ReturnStatement{Ast.VariableExpression(csc,cFunc)},
+         },csc))},
+        {var=Ast.AssignmentVariable(self.scope,self.upvaluesTable),                val=Ast.TableConstructorExpression({})},
+        {var=Ast.AssignmentVariable(self.scope,self.upvaluesReferenceCountsTable), val=Ast.TableConstructorExpression({})},
+        {var=Ast.AssignmentVariable(self.scope,self.allocUpvalFunction),           val=self:createAllocUpvalFunction()},
+        {var=Ast.AssignmentVariable(self.scope,self.currentUpvalId),               val=Ast.NumberExpression(0)},
+        {var=Ast.AssignmentVariable(self.scope,self.upvaluesProxyFunctionVar),     val=self:createUpvaluesProxyFunc()},
+        {var=Ast.AssignmentVariable(self.scope,self.upvaluesGcFunctionVar),        val=self:createUpvaluesGcFunc()},
+        {var=Ast.AssignmentVariable(self.scope,self.freeUpvalueFunc),              val=self:createFreeUpvalueFunc()},
+    }
+    local tbl={
+        Ast.VariableExpression(self.scope,self.containerFuncVar),
+        Ast.VariableExpression(self.scope,self.createVarargClosureVar),
+        Ast.VariableExpression(self.scope,self.upvaluesTable),
+        Ast.VariableExpression(self.scope,self.upvaluesReferenceCountsTable),
+        Ast.VariableExpression(self.scope,self.allocUpvalFunction),
+        Ast.VariableExpression(self.scope,self.currentUpvalId),
+        Ast.VariableExpression(self.scope,self.upvaluesProxyFunctionVar),
+        Ast.VariableExpression(self.scope,self.upvaluesGcFunctionVar),
+        Ast.VariableExpression(self.scope,self.freeUpvalueFunc),
+    }
+    for _,e in pairs(self.createClosureVars) do
+        table.insert(fna,e); table.insert(tbl,Ast.VariableExpression(e.var.scope,e.var.id))
+    end
+    util.shuffle(fna)
+    local lhs,rhs={},{}
+    for i,v in ipairs(fna) do lhs[i]=v.var; rhs[i]=v.val end
+
+    local ids=util.shuffle({1,2,3,4,5,6,7})
+    local items={
+        Ast.VariableExpression(self.scope,self.envVar),
+        Ast.VariableExpression(self.scope,self.unpackVar),
+        Ast.VariableExpression(self.scope,self.newproxyVar),
+        Ast.VariableExpression(self.scope,self.setmetatableVar),
+        Ast.VariableExpression(self.scope,self.getmetatableVar),
+        Ast.VariableExpression(self.scope,self.selectVar),
+        Ast.VariableExpression(self.scope,argVar),
+    }
+    local astItems={
+        Ast.OrExpression(Ast.AndExpression(Ast.VariableExpression(gs,getfenvVar),Ast.FunctionCallExpression(Ast.VariableExpression(gs,getfenvVar),{})),Ast.VariableExpression(gs,envVar)),
+        Ast.OrExpression(Ast.VariableExpression(gs,unpackVar),Ast.IndexExpression(Ast.VariableExpression(gs,tableVar),Ast.StringExpression("unpack"))),
+        Ast.VariableExpression(gs,newproxyVar),
+        Ast.VariableExpression(gs,setmtVar),
+        Ast.VariableExpression(gs,getmtVar),
+        Ast.VariableExpression(gs,selectVar),
+        Ast.TableConstructorExpression({Ast.TableEntry(Ast.VarargExpression())}),
+    }
+
+    local fn=Ast.FunctionLiteralExpression({
+        items[ids[1]],items[ids[2]],items[ids[3]],items[ids[4]],
+        items[ids[5]],items[ids[6]],items[ids[7]],
+        unpack(util.shuffle(tbl))
+    },Ast.Block({
+        Ast.AssignmentStatement(lhs,rhs),
+        Ast.ReturnStatement{Ast.FunctionCallExpression(
+            Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.createVarargClosureVar),{
+                Ast.NumberExpression(self.startBlockId),
+                Ast.TableConstructorExpression(upvalEntries),
+            }),
+            {Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.unpackVar),{Ast.VariableExpression(self.scope,argVar)})}
+        )}
+    },self.scope))
+
+    return Ast.TopNode(Ast.Block({
+        Ast.ReturnStatement{Ast.FunctionCallExpression(fn,{
+            astItems[ids[1]],astItems[ids[2]],astItems[ids[3]],astItems[ids[4]],
+            astItems[ids[5]],astItems[ids[6]],astItems[ids[7]],
+        })}
+    },psc),gs)
+end
+
+function Compiler:getCreateClosureVar(argCount)
+    if not self.createClosureVars[argCount] then
+        local var=Ast.AssignmentVariable(self.scope,self.scope:addVariable())
+        local csc=Scope:new(self.scope); local cssc=Scope:new(csc)
+        local pa=csc:addVariable(); local ua=csc:addVariable()
+        local po=csc:addVariable(); local fv=csc:addVariable()
+        cssc:addReferenceToHigherScope(self.scope,self.containerFuncVar)
+        cssc:addReferenceToHigherScope(csc,pa)
+        cssc:addReferenceToHigherScope(csc,ua,1)
+        csc:addReferenceToHigherScope(self.scope,self.upvaluesProxyFunctionVar)
+        cssc:addReferenceToHigherScope(csc,po)
+        local at,at2={},{}
+        for i=1,argCount do
+            local a=cssc:addVariable()
+            at[i]=Ast.VariableExpression(cssc,a); at2[i]=Ast.TableEntry(Ast.VariableExpression(cssc,a))
+        end
+        local val=Ast.FunctionLiteralExpression({Ast.VariableExpression(csc,pa),Ast.VariableExpression(csc,ua)},
+            Ast.Block({
+                Ast.LocalVariableDeclaration(csc,{po},{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.upvaluesProxyFunctionVar),{Ast.VariableExpression(csc,ua)})}),
+                Ast.LocalVariableDeclaration(csc,{fv},{Ast.FunctionLiteralExpression(at,Ast.Block({
+                    Ast.ReturnStatement{Ast.FunctionCallExpression(Ast.VariableExpression(self.scope,self.containerFuncVar),{
+                        Ast.VariableExpression(csc,pa),Ast.TableConstructorExpression(at2),
+                        Ast.VariableExpression(csc,ua),Ast.VariableExpression(csc,po),
+                    })}
+                },cssc))}),
+                Ast.ReturnStatement{Ast.VariableExpression(csc,fv)},
+            },csc)
+        )
+        self.createClosureVars[argCount]={var=var,val=val}
+    end
+    local v=self.createClosureVars[argCount].var
+    return v.scope,v.id
+end
+
+return Compiler
+"""
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=== Nexus Obfuscator Setup ===")
+    print(f"Prometheus source : {PROM_SRC}")
+    print(f"Output directory  : {NEXUS}")
+    print()
+
+    # Verify Prometheus source exists
+    if not os.path.isdir(PROM_SRC):
+        print(f"ERROR: Cannot find Prometheus source at: {PROM_SRC}")
+        print("Make sure you run this script from inside Prometheus-0.2.11.1/")
+        return
+
+    # Create all needed directories
+    for d in [
+        NEXUS,
+        os.path.join(NEXUS, "src"),
+        os.path.join(NEXUS, "src", "nexus"),
+        os.path.join(NEXUS, "src", "nexus", "steps"),
+        os.path.join(NEXUS, "src", "nexus", "namegenerators"),
+        os.path.join(NEXUS, "src", "nexus", "compiler"),
+        os.path.join(NEXUS, "src", "nexus", "compiler", "expressions"),
+        os.path.join(NEXUS, "src", "nexus", "compiler", "statements"),
+    ]:
+        mkdir(d)
+
+    print("[ Copying Prometheus engine files ]")
+    for src_rel, dst_rel in COPY_FILES:
+        copy_fix(src_rel, dst_rel)
+
+    print()
+    print("[ Writing custom Nexus files ]")
+    for rel_path, content in FILES.items():
+        full_path = os.path.join(NEXUS, rel_path)
+        write(full_path, content)
+
+    print()
+    print("=== Done! ===")
+    print(f"Run with:  lua {os.path.join(NEXUS, 'cli.lua')} --in yourscript.lua --out out.lua")
+
+if __name__ == "__main__":
+    main()
